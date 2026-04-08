@@ -1,0 +1,16 @@
+Makefile
+Makefile.old
+MYMETA.*
+Nats.xs
+Nats.c
+Nats.o
+Nats.bs
+*.so
+*.dylib
+*.dll
+*.tar.gz
+blib/
+pm_to_blib
+src/ppport.h
+MANIFEST.bak
+.claude/
