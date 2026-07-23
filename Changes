@@ -10,7 +10,10 @@ Revision history for EV::Nats
     - Defer DESTROY while a callback is on the stack (use-after-free)
     - Refuse a plaintext CONNECT to a tls_required server; treat auth
       errors as fatal regardless of case
-    - Fix builds without OpenSSL; ObjectStore digest is now base64url
+    - Fix builds without OpenSSL
+    - ObjectStore wire format now matches nats.go/ADR-20 (base64url names and
+      digests, deleted markers, overwrite cleanup); older buckets still read
+    - Add a mock-server test suite; fix POD links
 
 0.04  2026-06-02
     - Fix use-after-free when a callback clears its own handler

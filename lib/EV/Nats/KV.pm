@@ -237,47 +237,63 @@ that hide the underlying C<js_publish> + C<STREAM.MSG.GET> dance.
 
 All callbacks fire on the L<EV> loop, not synchronously.
 
-=head2 new(js => $js, bucket => $name, [timeout => $ms])
+=head2 new
+
+    new(js => $js, bucket => $name, [timeout => $ms])
 
 The bucket need not exist yet; call L</create_bucket> first to
 provision it. C<timeout> defaults to the timeout of C<$js>.
 
-=head2 get($key, $cb)
+=head2 get
+
+    get($key, $cb)
 
 Fetch the latest value for C<$key>. Callback: C<($value, $err)>.
 C<$value> is C<undef> if the key does not exist, or has been deleted
 or purged (the tombstone is recognised and surfaces as a clean miss).
 
-=head2 put($key, $value, $cb)
+=head2 put
+
+    put($key, $value, $cb)
 
 Set C<$key> to C<$value>. Callback: C<($seq, $err)>, where C<$seq> is
 the JetStream sequence number assigned by the server.
 
-=head2 create($key, $value, $cb)
+=head2 create
+
+    create($key, $value, $cb)
 
 Like C<put>, but only succeeds if C<$key> does not yet exist. Uses
 C<Nats-Expected-Last-Subject-Sequence: 0>; concurrent creators see
 a wrong-last-sequence error from the server. Callback: C<($seq, $err)>.
 
-=head2 delete($key, [$cb])
+=head2 delete
+
+    delete($key, [$cb])
 
 Mark C<$key> as deleted by publishing a C<KV-Operation: DEL> tombstone,
 followed by a C<flush> fence so a subsequent C<get> won't race the
 publish. Callback: C<($ok, $err)>; C<$err> is set if the connection
 dropped before the PONG arrived.
 
-=head2 purge($key, [$cb])
+=head2 purge
+
+    purge($key, [$cb])
 
 Like C<delete>, but emits C<Nats-Rollup: sub> too -- the prior history
 of C<$key> is rolled up and replaced by the tombstone, freeing storage.
 Callback: C<($ok, $err)>.
 
-=head2 keys($cb)
+=head2 keys
+
+    keys($cb)
 
 List all keys currently stored in the bucket. Callback: C<(\@keys, $err)>.
 Tombstoned keys are not filtered out -- check with C<get> if needed.
 
-=head2 watch($pattern, $cb)
+=head2 watch
+
+    watch($pattern, $cb)
 
 Subscribe to live changes. C<$pattern> is a NATS subject suffix relative
 to the bucket (e.g. C<E<gt>> for all keys, C<app.E<gt>> for everything
@@ -285,7 +301,9 @@ under C<app.>). Callback receives C<($key, $value, $op)> where C<$op>
 is C<PUT>, C<DEL>, or C<PURGE>. Returns the underlying subscription
 id; pass to L<EV::Nats/unsubscribe> to stop.
 
-=head2 create_bucket(\%opts, $cb)
+=head2 create_bucket
+
+    create_bucket(\%opts, $cb)
 
 Provision the underlying stream. Recognised C<\%opts>:
 
@@ -303,11 +321,15 @@ Provision the underlying stream. Recognised C<\%opts>:
 
 Callback: C<($info, $err)>.
 
-=head2 delete_bucket($cb)
+=head2 delete_bucket
+
+    delete_bucket($cb)
 
 Tear down the underlying stream. Callback: C<($info, $err)>.
 
-=head2 status($cb)
+=head2 status
+
+    status($cb)
 
 Returns a snapshot hashref:
 
