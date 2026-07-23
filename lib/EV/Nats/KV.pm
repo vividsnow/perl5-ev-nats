@@ -7,6 +7,8 @@ sub new {
     my ($class, %opts) = @_;
     my $js      = delete $opts{js}      || die "js (JetStream) required";
     my $bucket  = delete $opts{bucket}  || die "bucket name required";
+    # The bucket name is interpolated into subjects verbatim; validate (nats.go rule) up front.
+    die "invalid KV bucket name '$bucket'" unless $bucket =~ /\A[a-zA-Z0-9_-]+\z/;
     my $timeout = delete $opts{timeout} || $js->{timeout};
     bless {
         js      => $js,
@@ -16,8 +18,19 @@ sub new {
     }, $class;
 }
 
+# Keys are interpolated into subjects verbatim: spaces are a fatal protocol
+# error, * and > turn lookups into wildcards. Validate (nats.go rule) up front.
+sub _check_key {
+    my $key = shift;
+    die "invalid KV key '$key'"
+        unless defined $key
+            && $key =~ /\A[-\/_=.a-zA-Z0-9]+\z/
+            && $key !~ /\A\./ && $key !~ /\.\z/;
+}
+
 sub get {
     my ($self, $key, $cb) = @_;
+    _check_key($key);
     my $subj = '$KV.' . $self->{bucket} . '.' . $key;
     $self->{js}->_json_api(
         'STREAM.MSG.GET.' . $self->{stream},
@@ -44,6 +57,7 @@ sub get {
 
 sub put {
     my ($self, $key, $value, $cb) = @_;
+    _check_key($key);
     my $subj = '$KV.' . $self->{bucket} . '.' . $key;
     $self->{js}->js_publish($subj, $value, sub {
         my ($ack, $err) = @_;
@@ -54,6 +68,7 @@ sub put {
 
 sub create {
     my ($self, $key, $value, $cb) = @_;
+    _check_key($key);
     my $nats = $self->{js}{nats};
     my $headers = "NATS/1.0\r\nNats-Expected-Last-Subject-Sequence: 0\r\n\r\n";
     my $subj = '$KV.' . $self->{bucket} . '.' . $key;
@@ -81,6 +96,7 @@ sub create {
 
 sub delete {
     my ($self, $key, $cb) = @_;
+    _check_key($key);
     # KV delete = publish empty with KV-Operation: DEL header.
     # flush() ensures the tombstone reaches the server before $cb fires
     # so a subsequent get() doesn't race the publish.
@@ -93,6 +109,7 @@ sub delete {
 
 sub purge {
     my ($self, $key, $cb) = @_;
+    _check_key($key);
     my $headers = "NATS/1.0\r\nKV-Operation: PURGE\r\nNats-Rollup: sub\r\n\r\n";
     my $subj = '$KV.' . $self->{bucket} . '.' . $key;
     my $nats = $self->{js}{nats};

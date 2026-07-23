@@ -13,3 +13,4 @@ blib/
 pm_to_blib
 MANIFEST.bak
 .claude/
+.pcg/

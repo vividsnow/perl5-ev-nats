@@ -182,7 +182,9 @@ sub fetch {
 
     $sid = $nats->subscribe($inbox, sub {
         my ($subject, $payload, $reply, $headers) = @_;
-        if ($headers && $headers =~ m{^NATS/1\.0\s+(\d+)}) {
+        # Status lines are exactly "NATS/1.0 <3 digits>"; a loose \s+ would
+        # swallow a headered DATA message's first header as a status frame.
+        if ($headers && $headers =~ m{\ANATS/1\.0 (\d{3})(?:[ \r\n]|\z)}) {
             my $code = $1;
             # A NATS/1.0 status frame is a control message, never data, so it
             # must not be pushed as a result. 100 = idle heartbeat / flow

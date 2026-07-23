@@ -1,7 +1,7 @@
 package EV::Nats::ObjectStore;
 use strict;
 use warnings;
-use Digest::SHA qw(sha256_hex);
+use Digest::SHA qw(sha256 sha256_hex);
 use EV::Nats::JetStream;
 
 my $CHUNK_SIZE = 128 * 1024; # 128KB default
@@ -48,7 +48,9 @@ sub delete_bucket {
 sub put {
     my ($self, $name, $data, $cb) = @_;
     my $nuid   = _nuid();
-    my $sha    = sha256_hex($data);
+    # ADR-20 digest: base64url of the raw SHA-256 bytes (nats.go interop).
+    require MIME::Base64;
+    my $sha    = MIME::Base64::encode_base64url(sha256($data));
     my $size   = length $data;
     my $chunks = 0;
     my $offset = 0;
@@ -95,11 +97,13 @@ sub put {
         $chunks = 1;
         $publish_chunk->('');
     } else {
+        # Fix the total first: an ack arriving before the loop ends would
+        # otherwise complete the object with a short count.
+        $chunks = int(($size + $self->{chunk_size} - 1) / $self->{chunk_size});
         while ($offset < $size) {
             my $end = $offset + $self->{chunk_size};
             $end = $size if $end > $size;
             $publish_chunk->(substr($data, $offset, $end - $offset));
-            $chunks++;
             $offset = $end;
         }
     }
@@ -115,7 +119,11 @@ sub get {
         { last_by_subj => $meta_subj },
         sub {
             my ($resp, $err) = @_;
-            return $cb->(undef, $err) if $err;
+            if ($err) {
+                # Missing object is a clean miss, same as info()/KV::get.
+                return $cb->(undef, undef) if $err =~ /no message found|10037/;
+                return $cb->(undef, $err);
+            }
 
             my $msg = $resp->{message} or return $cb->(undef, undef);
             # Object was deleted: tombstone is on the metadata subject.
@@ -150,10 +158,16 @@ sub get {
                     sub {
                         my ($resp, $err) = @_;
                         if ($err) {
+                            # Break the $fetch_next self-cycle before firing
+                            # $cb, or the closure pins $self forever.
+                            undef $fetch_next;
                             return $cb->(undef, "chunk fetch error: $err", $meta);
                         }
-                        my $msg = $resp->{message} or
+                        my $msg = $resp->{message};
+                        if (!$msg) {
+                            undef $fetch_next;
                             return $cb->(undef, "missing chunk message", $meta);
+                        }
                         my $data = MIME::Base64::decode_base64($msg->{data} || '');
                         push @chunks, $data;
                         $seq = ($msg->{seq} || $seq) + 1;
@@ -161,10 +175,18 @@ sub get {
                         if (scalar @chunks >= $expected) {
                             my $assembled = join('', @chunks);
                             if ($meta->{digest} && $meta->{digest} =~ /^SHA-256=(.+)/) {
-                                if (sha256_hex($assembled) ne $1) {
+                                # Accept base64url (ADR-20) and the legacy hex
+                                # of 0.03/0.04 so existing buckets verify.
+                                my $stored = $1;
+                                my $got = $stored =~ /\A[0-9a-f]{64}\z/
+                                    ? sha256_hex($assembled)
+                                    : MIME::Base64::encode_base64url(sha256($assembled));
+                                if ($got ne $stored) {
+                                    undef $fetch_next;
                                     return $cb->(undef, "digest mismatch", $meta);
                                 }
                             }
+                            undef $fetch_next;
                             $cb->($assembled, undef, $meta);
                         } else {
                             $fetch_next->();
