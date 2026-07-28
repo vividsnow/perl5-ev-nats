@@ -80,7 +80,6 @@ subtest 'CONNECT flush larger than the send buffer survives EAGAIN' => sub {
 };
 
 subtest "IPv4-only server reachable as 'localhost' on a dual-stack host" => sub {
-    plan tests => 2;
     my ($err, @res) = Socket::getaddrinfo('localhost', '0',
         { family => AF_UNSPEC, socktype => SOCK_STREAM });
     plan skip_all => "cannot resolve localhost: $err" if $err;
@@ -119,4 +118,5 @@ subtest "IPv4-only server reachable as 'localhost' on a dual-stack host" => sub 
         undef $nats;
     }
     $mock->stop;
+    done_testing;
 };
