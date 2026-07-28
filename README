@@ -54,9 +54,10 @@ DESCRIPTION
     Token, user/pass, NKey/JWT (Ed25519 via OpenSSL).
 
   TLS
-    Optional, auto-detected at build time. STARTTLS-style upgrade after
-    INFO; full hostname verification (DNS or IP literal) by default; opt-out
-    "tls_skip_verify"; custom CA via "tls_ca_file".
+    Optional, auto-detected at build time. Supports both the traditional
+    post-INFO TLS upgrade and strict TLS-handshake-first connections; full
+    hostname verification (DNS or IP literal) by default; custom CAs and
+    mTLS client certificates.
 
   Performance
     Write coalescing via "ev_prepare" (one write() per loop iteration); O(1)
@@ -125,7 +126,20 @@ METHODS
         "creds_file".
 
     tls => Bool / tls_ca_file => Str / tls_skip_verify => Bool
-        See "tls" for details.
+        Configure server-authenticated TLS. See "tls" for details.
+
+    tls_handshake_first => Bool
+        Perform the TLS handshake immediately after TCP connect, before
+        reading the server's INFO line. Enabling this also enables TLS. The
+        server must be configured for "handshake_first"; there is no
+        client-side fallback to the traditional INFO-first flow.
+
+    tls_cert_file => Str / tls_key_file => Str
+        PEM client certificate chain and matching unencrypted PEM private
+        key for mTLS. Both options must be non-empty and supplied together.
+        Either option enables TLS.
+
+        See "tls_client_cert" for the runtime setter.
 
    Protocol options
     verbose => Bool (default 0)
@@ -391,6 +405,30 @@ METHODS
     "connect". May also be passed to "new" as "tls => 1, tls_ca_file =>
     $path".
 
+    TLS configuration may be changed only while no connection or reconnect
+    attempt is active.
+
+  tls_handshake_first([$enable])
+    Get or set strict TLS-handshake-first mode. When enabled, TLS starts
+    immediately after the socket connects and before the client reads INFO.
+    It also enables TLS. A server using the traditional INFO-first flow
+    causes the connection to fail; EV::Nats does not downgrade or retry in
+    another TLS mode.
+
+    The mode may be changed only while no connection or reconnect attempt is
+    active. It may also be passed to "new" as "tls_handshake_first => 1".
+
+  tls_client_cert($cert_file, $key_file)
+    Configure an mTLS client identity. $cert_file is a PEM certificate chain
+    and $key_file is its matching unencrypted PEM private key. Both paths
+    must be non-empty; invalid files and mismatched keys are reported before
+    the NATS CONNECT command is sent. Password-protected private keys are
+    not supported.
+
+    The identity may be changed only while no connection or reconnect
+    attempt is active. It may also be passed to "new" as "tls_cert_file =>
+    $cert_file, tls_key_file => $key_file".
+
   stats
     Returns a hash of connection counters:
 
@@ -489,4 +527,3 @@ AUTHOR
 LICENSE
     This library is free software; you can redistribute it and/or modify it
     under the same terms as Perl itself.
-

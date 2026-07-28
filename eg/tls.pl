@@ -13,9 +13,14 @@ $nats = EV::Nats->new(
     tls             => 1,
     tls_ca_file     => $ENV{NATS_CA_FILE},      # optional, uses system CAs if omitted
     tls_skip_verify => $ENV{NATS_SKIP_VERIFY},   # for self-signed certs
+    tls_handshake_first => $ENV{NATS_TLS_FIRST}, # server handshake_first: true
+    tls_cert_file   => $ENV{NATS_CERT_FILE},     # both required for mTLS
+    tls_key_file    => $ENV{NATS_KEY_FILE},      # unencrypted PEM key
     on_error   => sub { warn "error: @_\n" },
     on_connect => sub {
-        print "connected with TLS\n";
+        print "connected with TLS"
+            . ($ENV{NATS_CERT_FILE} ? " and a client certificate" : "")
+            . "\n";
         $nats->publish('tls.test', 'encrypted hello');
         $nats->flush(sub {
             print "message flushed\n";

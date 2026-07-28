@@ -1,5 +1,11 @@
 Revision history for EV::Nats
 
+0.06  unreleased
+    - Add strict TLS-handshake-first support before the server INFO line
+    - Add mTLS client certificate and private-key authentication
+    - Reject TLS configuration changes while a connection attempt is active
+    - Make the TLS integration suite self-contained and cover reconnects
+
 0.05  2026-07-23
     - Fix stack overflow decoding an over-long NKey seed, and out-of-bounds
       reads in the INFO parser

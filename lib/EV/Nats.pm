@@ -5,7 +5,7 @@ use EV;
 
 BEGIN {
     use XSLoader;
-    our $VERSION = '0.05';
+    our $VERSION = '0.06';
     XSLoader::load __PACKAGE__, $VERSION;
 }
 
@@ -110,9 +110,10 @@ Token, user/pass, NKey/JWT (Ed25519 via OpenSSL).
 
 =head2 TLS
 
-Optional, auto-detected at build time. STARTTLS-style upgrade after
-INFO; full hostname verification (DNS or IP literal) by default;
-opt-out C<tls_skip_verify>; custom CA via C<tls_ca_file>.
+Optional, auto-detected at build time. Supports both the traditional
+post-INFO TLS upgrade and strict TLS-handshake-first connections; full
+hostname verification (DNS or IP literal) by default; custom CAs and
+mTLS client certificates.
 
 =head2 Performance
 
@@ -209,7 +210,22 @@ L</creds_file>.
 
 =item tls => Bool / tls_ca_file => Str / tls_skip_verify => Bool
 
-See L</tls> for details.
+Configure server-authenticated TLS. See L</tls> for details.
+
+=item tls_handshake_first => Bool
+
+Perform the TLS handshake immediately after TCP connect, before reading
+the server's INFO line. Enabling this also enables TLS. The server must
+be configured for C<handshake_first>; there is no client-side fallback
+to the traditional INFO-first flow.
+
+=item tls_cert_file => Str / tls_key_file => Str
+
+PEM client certificate chain and matching unencrypted PEM private key
+for mTLS. Both options must be non-empty and supplied together. Either
+option enables TLS.
+
+See L</tls_client_cert> for the runtime setter.
 
 =back
 
@@ -604,6 +620,37 @@ When verification is enabled (the default), the server certificate's
 SAN must match either the resolved IP literal or the DNS hostname
 passed to L</connect>. May also be passed to L</new> as C<tls =E<gt> 1,
 tls_ca_file =E<gt> $path>.
+
+TLS configuration may be changed only while no connection or reconnect
+attempt is active.
+
+=head2 tls_handshake_first
+
+    tls_handshake_first([$enable])
+
+Get or set strict TLS-handshake-first mode. When enabled, TLS starts
+immediately after the socket connects and before the client reads INFO.
+It also enables TLS. A server using the traditional INFO-first flow
+causes the connection to fail; EV::Nats does not downgrade or retry in
+another TLS mode.
+
+The mode may be changed only while no connection or reconnect attempt
+is active. It may also be passed to L</new> as
+C<tls_handshake_first =E<gt> 1>.
+
+=head2 tls_client_cert
+
+    tls_client_cert($cert_file, $key_file)
+
+Configure an mTLS client identity. C<$cert_file> is a PEM certificate
+chain and C<$key_file> is its matching unencrypted PEM private key.
+Both paths must be non-empty; invalid files and mismatched keys are
+reported before the NATS CONNECT command is sent. Password-protected
+private keys are not supported.
+
+The identity may be changed only while no connection or reconnect
+attempt is active. It may also be passed to L</new> as
+C<tls_cert_file =E<gt> $cert_file, tls_key_file =E<gt> $key_file>.
 
 =head2 stats
 

@@ -3,6 +3,7 @@ use strict;
 use warnings;
 use Exporter 'import';
 use IO::Socket::INET;
+use POSIX ();
 use Test::More ();
 use EV;
 
@@ -12,6 +13,8 @@ our @EXPORT_OK = qw(
     free_port
     nats_bin_or_skip
     spawn_nats
+    wait_for_port
+    stop_nats
 );
 
 # Probe TEST_NATS_HOST:TEST_NATS_PORT (defaulting to 127.0.0.1:4222)
@@ -75,11 +78,45 @@ sub spawn_nats {
     die "fork: $!" unless defined $pid;
     if ($pid == 0) {
         { exec $bin, @args }
-        require POSIX;
         POSIX::_exit(1);
     }
     sleep 1;
     return $pid;
+}
+
+# Wait until a TCP listener accepts connections. Returns true on success.
+sub wait_for_port {
+    my ($host, $port, $timeout) = @_;
+    $timeout = 5 unless defined $timeout;
+    my $deadline = time + $timeout;
+    while (time < $deadline) {
+        my $sock = IO::Socket::INET->new(
+            PeerAddr => $host, PeerPort => $port, Timeout => 0.2,
+        );
+        if ($sock) {
+            close $sock;
+            return 1;
+        }
+        select undef, undef, undef, 0.05;
+    }
+    return 0;
+}
+
+# TERM with a bounded wait, KILL as a backstop, and always reap the process.
+sub stop_nats {
+    my ($pid) = @_;
+    return unless $pid;
+    local $?;
+    kill 'TERM', $pid;
+    my $deadline = time + 5;
+    while (time < $deadline) {
+        my $r = waitpid $pid, POSIX::WNOHANG();
+        return if $r == $pid || $r == -1;
+        select undef, undef, undef, 0.05;
+    }
+    kill 'KILL', $pid;
+    waitpid $pid, 0;
+    return;
 }
 
 1;
