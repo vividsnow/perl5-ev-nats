@@ -246,14 +246,18 @@ struct nats_s {
        destroy_pending; the outermost nats_on_* wrapper frees (cb_depth) */
     int cb_depth;
     int destroy_pending;
+    int tls_unavailable_requested;
 
     /* TLS */
 #ifdef HAVE_OPENSSL
     SSL_CTX *ssl_ctx;
     SSL     *ssl;
     int tls;
+    int tls_handshake_first;
     int tls_skip_verify;
     char *tls_ca_file;
+    char *tls_cert_file;
+    char *tls_key_file;
     int ssl_handshaking;
 #endif
 };
@@ -627,25 +631,102 @@ static ssize_t nats_io_write(nats_t *self, const void *buf, size_t len)
 }
 
 #ifdef HAVE_OPENSSL
+enum {
+    NATS_SSL_SETUP_ERROR = -1,
+    NATS_SSL_CERT_ERROR = -2,
+    NATS_SSL_KEY_ERROR = -3,
+    NATS_SSL_KEY_MISMATCH = -4
+};
+
+static int nats_ssl_no_password(char *buf, int size, int rwflag, void *userdata)
+{
+    (void)buf; (void)size; (void)rwflag; (void)userdata;
+    return 0;
+}
+
+static void nats_ssl_ctx_reset(nats_t *self)
+{
+    if (self->ssl_ctx) {
+        SSL_CTX_free(self->ssl_ctx);
+        self->ssl_ctx = NULL;
+    }
+}
+
+static int nats_tls_config_valid(nats_t *self)
+{
+    if (!!self->tls_cert_file != !!self->tls_key_file)
+        return 0;
+    if ((self->tls_cert_file && (!*self->tls_cert_file || !*self->tls_key_file)))
+        return 0;
+    if (self->tls_handshake_first || self->tls_cert_file)
+        self->tls = 1;
+    return 1;
+}
+
+static const char *nats_ssl_setup_error_prefix(int rc)
+{
+    switch (rc) {
+        case NATS_SSL_CERT_ERROR:
+            return "SSL client certificate load failed";
+        case NATS_SSL_KEY_ERROR:
+            return "SSL client key load failed";
+        case NATS_SSL_KEY_MISMATCH:
+            return "SSL client certificate/key mismatch";
+        default:
+            return "SSL setup failed";
+    }
+}
+
+static void nats_ssl_fail(nats_t *self, const char *prefix);
+
 static int nats_ssl_setup(nats_t *self)
 {
     if (!self->ssl_ctx) {
-        self->ssl_ctx = SSL_CTX_new(TLS_client_method());
-        if (!self->ssl_ctx) return -1;
+        SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+        if (!ctx) return NATS_SSL_SETUP_ERROR;
+
+        /* Encrypted private keys are not supported. Never let OpenSSL prompt
+           on stdin from inside the event loop. */
+        SSL_CTX_set_default_passwd_cb(ctx, nats_ssl_no_password);
 
         if (self->tls_ca_file && *self->tls_ca_file) {
-            if (!SSL_CTX_load_verify_locations(self->ssl_ctx, self->tls_ca_file, NULL))
-                return -1;
+            if (!SSL_CTX_load_verify_locations(ctx, self->tls_ca_file, NULL)) {
+                SSL_CTX_free(ctx);
+                return NATS_SSL_SETUP_ERROR;
+            }
         } else {
-            SSL_CTX_set_default_verify_paths(self->ssl_ctx);
+            SSL_CTX_set_default_verify_paths(ctx);
         }
 
         if (!self->tls_skip_verify)
-            SSL_CTX_set_verify(self->ssl_ctx, SSL_VERIFY_PEER, NULL);
+            SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+
+        if (self->tls_cert_file) {
+            if (SSL_CTX_use_certificate_chain_file(ctx, self->tls_cert_file) != 1) {
+                SSL_CTX_free(ctx);
+                return NATS_SSL_CERT_ERROR;
+            }
+            if (SSL_CTX_use_PrivateKey_file(ctx, self->tls_key_file,
+                                           SSL_FILETYPE_PEM) != 1) {
+                int rc = NATS_SSL_KEY_ERROR;
+#ifdef X509_R_KEY_VALUES_MISMATCH
+                if (ERR_GET_REASON(ERR_peek_last_error()) == X509_R_KEY_VALUES_MISMATCH)
+                    rc = NATS_SSL_KEY_MISMATCH;
+#endif
+                SSL_CTX_free(ctx);
+                return rc;
+            }
+            if (SSL_CTX_check_private_key(ctx) != 1) {
+                SSL_CTX_free(ctx);
+                return NATS_SSL_KEY_MISMATCH;
+            }
+        }
+
+        self->ssl_ctx = ctx;
     }
 
     self->ssl = SSL_new(self->ssl_ctx);
-    if (!self->ssl) return -1;
+    if (!self->ssl) return NATS_SSL_SETUP_ERROR;
 
     SSL_set_fd(self->ssl, self->fd);
     if (self->host) {
@@ -657,7 +738,7 @@ static int nats_ssl_setup(nats_t *self)
             if (vpm && !X509_VERIFY_PARAM_set1_ip_asc(vpm, self->host)) {
                 X509_VERIFY_PARAM_set_hostflags(vpm, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
                 if (!X509_VERIFY_PARAM_set1_host(vpm, self->host, 0))
-                    return -1;
+                    return NATS_SSL_SETUP_ERROR;
             }
         }
     }
@@ -679,10 +760,18 @@ static int nats_ssl_handshake(nats_t *self)
     int ret = SSL_connect(self->ssl);
     if (ret == 1) {
         self->ssl_handshaking = 0;
+        if (!self->reading) {
+            ev_io_start(self->loop, &self->rio);
+            self->reading = 1;
+        }
         return 1;
     }
     int err = SSL_get_error(self->ssl, ret);
     if (err == SSL_ERROR_WANT_READ) {
+        if (self->writing) {
+            ev_io_stop(self->loop, &self->wio);
+            self->writing = 0;
+        }
         if (!self->reading) {
             ev_io_start(self->loop, &self->rio);
             self->reading = 1;
@@ -697,6 +786,23 @@ static int nats_ssl_handshake(nats_t *self)
         return 0;
     }
     return -1;
+}
+
+static int nats_ssl_start(nats_t *self)
+{
+    int rc = nats_ssl_setup(self);
+    if (rc != 0) {
+        nats_ssl_fail(self, nats_ssl_setup_error_prefix(rc));
+        return -1;
+    }
+
+    self->ssl_handshaking = 1;
+    rc = nats_ssl_handshake(self);
+    if (rc < 0) {
+        nats_ssl_fail(self, "SSL handshake failed");
+        return -1;
+    }
+    return rc;
 }
 
 /* Emit "<prefix>: <openssl-error>", clean up the connection. */
@@ -715,6 +821,10 @@ static void nats_ssl_fail(nats_t *self, const char *prefix)
     nats_emit_error(self, msg);
     nats_cleanup(self);
 }
+#endif
+
+#ifndef HAVE_OPENSSL
+#define nats_tls_config_valid(self) 1
 #endif
 
 /* ================================================================
@@ -1484,16 +1594,8 @@ static void nats_process_line(nats_t *self, char *line, size_t len)
             }
 #ifdef HAVE_OPENSSL
             if (self->tls && !self->ssl) {
-                if (nats_ssl_setup(self) != 0) {
-                    nats_ssl_fail(self, "SSL setup failed");
-                    return;
-                }
-                self->ssl_handshaking = 1;
-                int hret = nats_ssl_handshake(self);
-                if (hret < 0) {
-                    nats_ssl_fail(self, "SSL handshake failed");
-                    return;
-                }
+                int hret = nats_ssl_start(self);
+                if (hret < 0) return;
                 if (hret == 1) {
                     self->ssl_handshaking = 0;
                     nats_send_connect(self);
@@ -1665,16 +1767,45 @@ static int nats_failover_next_addr(nats_t *self)
 {
     if (!self->ai_next) return 0;
     nats_stop_watchers(self);
+    if (self->connect_timer_active) {
+        ev_timer_stop(self->loop, &self->connect_timer);
+        self->connect_timer_active = 0;
+    }
+#ifdef HAVE_OPENSSL
+    nats_ssl_cleanup(self);
+#endif
     close(self->fd);
     self->fd = -1;
+    self->connecting = 0;
+    self->connect_pending = 0;
     nats_connect_tcp(self);
     return 1;
 }
 
 static void nats_on_read_inner(nats_t *self)
 {
+    if (self->connect_pending) {
+        int err = 0;
+        socklen_t errlen = sizeof(err);
+        getsockopt(self->fd, SOL_SOCKET, SO_ERROR, &err, &errlen);
+        if (err) {
+            if (nats_failover_next_addr(self))
+                return;
+            nats_emit_error(self, strerror(err));
+            nats_cleanup(self);
+            return;
+        }
+        /* Readability proves the nonblocking connect completed. Clear this
+           before INFO can start TLS and change the write watcher state. */
+        self->connect_pending = 0;
+    }
 
 #ifdef HAVE_OPENSSL
+    if (self->tls_handshake_first && !self->ssl) {
+        if (nats_ssl_start(self) <= 0)
+            return;
+    }
+
     if (self->ssl_handshaking) {
         int hret = nats_ssl_handshake(self);
         if (hret == 0) return;
@@ -1687,9 +1818,9 @@ static void nats_on_read_inner(nats_t *self)
             ev_io_stop(self->loop, &self->wio);
             self->writing = 0;
         }
-        /* Handshake completed after the post-INFO upgrade. Send CONNECT
-           over the now-encrypted channel. */
-        if (self->connecting) {
+        /* INFO-first sends CONNECT now; TLS-first still needs to read INFO
+           from the encrypted stream. */
+        if (self->connecting && !self->tls_handshake_first) {
             nats_send_connect(self);
             nats_try_write(self);
         }
@@ -1858,6 +1989,12 @@ static void nats_on_write_inner(nats_t *self)
         /* TCP connect complete. Fall through: wbuf may already hold part
            of the CONNECT flush; nats_try_write disarms wio once empty. */
         self->connect_pending = 0;
+#ifdef HAVE_OPENSSL
+        if (self->tls_handshake_first && !self->ssl) {
+            int hret = nats_ssl_start(self);
+            if (hret <= 0) return;
+        }
+#endif
     }
 
 #ifdef HAVE_OPENSSL
@@ -1870,7 +2007,7 @@ static void nats_on_write_inner(nats_t *self)
         }
         if (hret == 0) return;
         self->ssl_handshaking = 0;
-        if (self->connecting)
+        if (self->connecting && !self->tls_handshake_first)
             nats_send_connect(self);
     }
 #endif
@@ -2234,6 +2371,11 @@ static void nats_after_connect(nats_t *self, int fd, int rv)
         ev_timer_start(self->loop, &self->connect_timer);
         self->connect_timer_active = 1;
     }
+
+#ifdef HAVE_OPENSSL
+    if (rv == 0 && self->tls_handshake_first)
+        nats_ssl_start(self);
+#endif
 }
 
 /* Drop the saved getaddrinfo list; NULLs both fields, never frees twice. */
@@ -2298,8 +2440,10 @@ static void nats_destroy_now(nats_t *self)
     }
 #ifdef HAVE_OPENSSL
     nats_ssl_cleanup(self);
-    if (self->ssl_ctx) { SSL_CTX_free(self->ssl_ctx); self->ssl_ctx = NULL; }
+    nats_ssl_ctx_reset(self);
     Safefree(self->tls_ca_file);
+    Safefree(self->tls_cert_file);
+    Safefree(self->tls_key_file);
 #endif
 
     Safefree(self->rbuf);
@@ -2530,12 +2674,39 @@ new(class, ...)
 #ifdef HAVE_OPENSSL
             else if (strcmp(key, "tls") == 0)
                 self->tls = SvTRUE(val) ? 1 : 0;
+            else if (strcmp(key, "tls_handshake_first") == 0) {
+                self->tls_handshake_first = SvTRUE(val) ? 1 : 0;
+                if (self->tls_handshake_first) self->tls = 1;
+            }
             else if (strcmp(key, "tls_ca_file") == 0)
                 nats_set_str_sv(&self->tls_ca_file, val);
             else if (strcmp(key, "tls_skip_verify") == 0)
                 self->tls_skip_verify = SvTRUE(val) ? 1 : 0;
+            else if (strcmp(key, "tls_cert_file") == 0)
+                nats_set_str_sv(&self->tls_cert_file, val);
+            else if (strcmp(key, "tls_key_file") == 0)
+                nats_set_str_sv(&self->tls_key_file, val);
             else if (strcmp(key, "nkey_seed") == 0)
                 nats_set_str_sv(&self->nkey_seed, val);
+#else
+            else if (strcmp(key, "tls") == 0)
+                self->tls_unavailable_requested |= SvTRUE(val) ? 1 : 0;
+            else if (strcmp(key, "tls_handshake_first") == 0)
+                self->tls_unavailable_requested |= SvTRUE(val) ? 1 : 0;
+            else if (strcmp(key, "tls_ca_file") == 0 ||
+                     strcmp(key, "tls_cert_file") == 0 ||
+                     strcmp(key, "tls_key_file") == 0) {
+                if (strcmp(key, "tls_cert_file") == 0 ||
+                    strcmp(key, "tls_key_file") == 0)
+                    self->tls_unavailable_requested = 1;
+                if (SvOK(val)) {
+                    STRLEN len;
+                    (void)SvPV(val, len);
+                    self->tls_unavailable_requested |= len > 0 ? 1 : 0;
+                }
+            }
+            else if (strcmp(key, "tls_skip_verify") == 0)
+                self->tls_unavailable_requested |= SvTRUE(val) ? 1 : 0;
 #endif
             else if (strcmp(key, "jwt") == 0)
                 nats_set_str_sv(&self->jwt, val);
@@ -2550,6 +2721,16 @@ new(class, ...)
             else
                 warn("EV::Nats::new: unknown option '%s'", key);
         }
+    }
+
+    if (self->tls_unavailable_requested) {
+        nats_destroy_now(self);
+        croak("TLS support is unavailable in this EV::Nats build");
+    }
+
+    if (!nats_tls_config_valid(self)) {
+        nats_destroy_now(self);
+        croak("tls_cert_file and tls_key_file must both be non-empty");
     }
 
     if (self->host || self->path)
@@ -3058,9 +3239,42 @@ tls(self, enable, ca_file = NULL, skip_verify = 0)
     const char *ca_file
     int skip_verify
   CODE:
-    self->tls = enable;
+    if (self->connected || self->connecting || self->reconnect_timer_active)
+        croak("cannot change TLS configuration while connection is active");
+    self->tls = enable || self->tls_handshake_first || self->tls_cert_file;
     self->tls_skip_verify = skip_verify;
     nats_set_str(&self->tls_ca_file, (ca_file && *ca_file) ? ca_file : NULL);
+    nats_ssl_ctx_reset(self);
+
+int
+tls_handshake_first(self, ...)
+    EV::Nats self
+  CODE:
+    if (items > 1) {
+        if (self->connected || self->connecting || self->reconnect_timer_active)
+            croak("cannot change TLS handshake mode while connection is active");
+        self->tls_handshake_first = SvTRUE(ST(1)) ? 1 : 0;
+        if (self->tls_handshake_first)
+            self->tls = 1;
+    }
+    RETVAL = self->tls_handshake_first;
+  OUTPUT:
+    RETVAL
+
+void
+tls_client_cert(self, cert_file, key_file)
+    EV::Nats self
+    const char *cert_file
+    const char *key_file
+  CODE:
+    if (self->connected || self->connecting || self->reconnect_timer_active)
+        croak("cannot change TLS client certificate while connection is active");
+    if (!cert_file || !*cert_file || !key_file || !*key_file)
+        croak("client certificate and key must both be non-empty");
+    nats_set_str(&self->tls_cert_file, cert_file);
+    nats_set_str(&self->tls_key_file, key_file);
+    self->tls = 1;
+    nats_ssl_ctx_reset(self);
 
 #endif
 
