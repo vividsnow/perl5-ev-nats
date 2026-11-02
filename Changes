@@ -1,5 +1,11 @@
 Revision history for EV::Nats
 
+0.07  unreleased
+    - Add strict TLS-handshake-first support before the server INFO line
+    - Add mTLS client certificate and private-key authentication
+    - Reject TLS configuration changes while a connection attempt is active
+    - Make the TLS integration suite self-contained and cover reconnects
+
 0.06  2026-10-16
     - Fix TLS retries, reconnect teardown and callback ordering.
     - Report disconnected KV writes through callbacks and clean failed construction.

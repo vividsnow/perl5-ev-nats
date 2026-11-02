@@ -1,7 +1,7 @@
 package EV::Nats::JetStream;
 use strict;
 use warnings;
-our $VERSION = '0.06';
+our $VERSION = '0.07';
 use EV;
 use JSON::PP ();
 

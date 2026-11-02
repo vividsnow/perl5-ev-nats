@@ -1,7 +1,7 @@
 package EV::Nats::ObjectStore;
 use strict;
 use warnings;
-our $VERSION = '0.06';
+our $VERSION = '0.07';
 use Digest::SHA qw(sha256 sha256_hex);
 use EV::Nats::JetStream;
 
