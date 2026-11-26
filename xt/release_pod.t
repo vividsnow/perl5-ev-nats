@@ -26,7 +26,7 @@ my %internal = map { $_ => 1 } qw(
     pub hpub sub unsub req hreq
     timer watch_disconnect unwatch_disconnect is_subscribed
     json_api decoded later fail_later err_status with_timeout subjects_under
-    all_pages create_bucket_stream put_subject
+    all_pages offset_pages create_bucket_stream put_subject
     noting_direct get_msg get_msg_using decode_json_or_error msg_is_tombstone
     reply_of ack_reply
     subject expect_publish tombstone

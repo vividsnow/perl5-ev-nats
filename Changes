@@ -1,5 +1,9 @@
 Revision history for EV::Nats
 
+0.09  2026-11-27
+    - stream_list, consumer_list and KV/ObjectStore key listings no longer
+      skip or repeat entries when the list changes while it is paged.
+
 0.08  2026-11-26
     - KV and ObjectStore read with Direct Get; add direct_get and ack_sync.
     - KV watch uses a JetStream consumer: no gap after a reconnect.

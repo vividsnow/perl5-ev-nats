@@ -1,7 +1,7 @@
 package EV::Nats::ObjectStore;
 use strict;
 use warnings;
-our $VERSION = '0.08';
+our $VERSION = '0.09';
 use Digest::SHA qw(sha256 sha256_hex);
 use JSON::PP ();
 use MIME::Base64 ();

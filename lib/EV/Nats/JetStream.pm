@@ -1,7 +1,7 @@
 package EV::Nats::JetStream;
 use strict;
 use warnings;
-our $VERSION = '0.08';
+our $VERSION = '0.09';
 use JSON::PP ();
 
 sub new {
@@ -90,20 +90,56 @@ sub fail_later {
 }
 
 # the subjects under $prefix that hold messages, without the prefix; the
-# server pages them (100k per reply), so follow offset up to total
+# server pages them, 100k per reply
 sub subjects_under {
-    my ($self, $stream, $prefix, $cb, $got, $offset) = @_;
-    $got //= {};
-    $self->stream_info($stream, { subjects_filter => "$prefix>", ($offset ? (offset => $offset) : ()) }, sub {
-        my ($info, $err) = @_;
-        return $cb->(undef, $err) if $err;
-        my $page = $info->{state}{subjects} || {};
-        my $plen = length $prefix;
-        $got->{ substr $_, $plen } = 1 for grep { substr($_, 0, $plen) eq $prefix } keys %$page;
-        my $next = ($info->{offset} || 0) + keys %$page;
-        return $self->subjects_under($stream, $prefix, $cb, $got, $next)
-            if %$page && $info->{total} && $next < $info->{total};
-        $cb->([ keys %$got ], undef);
+    my ($self, $stream, $prefix, $cb) = @_;
+    my $plen = length $prefix;
+    $self->offset_pages(sub {
+        my ($offset, $done) = @_;
+        $self->stream_info($stream, { subjects_filter => "$prefix>", ($offset ? (offset => $offset) : ()) }, sub {
+            my ($info, $err) = @_;
+            return $cb->(undef, $err) if $err;
+            $done->($info, $info->{total},
+                map { [ $_, substr $_, $plen ] } grep { substr($_, 0, $plen) eq $prefix }
+                sort keys %{ $info->{state}{subjects} || {} });
+        });
+    }, sub { $cb->($_[0], undef) });
+}
+
+my $RELIST = 3;   # list again from the start at most this often, then settle
+
+# The API pages a name-sorted list by offset, so an entry created or deleted
+# ahead of the offset between two requests shifts the next page. Each later
+# page is asked one entry early: when it does not start with the last entry
+# held, the list moved and is read again. Past $RELIST, plain offsets finish
+# it without duplicates. $fetch->($offset, $done) answers
+# $done->($resp, $total, [$name, $item]...) in server order, or reports an
+# error itself; $cb gets ([$item...], $last_resp).
+sub offset_pages {
+    my ($self, $fetch, $cb, $st) = @_;
+    $st //= { items => [], seen => {}, relists => 0, offset => undef };
+    my $items = $st->{items};
+    my $offset = $st->{offset} // (@$items ? @$items - 1 : 0);
+    $fetch->($offset, sub {
+        my ($resp, $total, @page) = @_;
+        my $had = @$items;
+        if ($had && !defined $st->{offset}) {
+            if (@page && $page[0][0] eq $items->[-1][0]) {
+                shift @page;
+            } elsif ($st->{relists}++ < $RELIST) {
+                @$items = ();
+                %{ $st->{seen} } = ();
+                return $self->offset_pages($fetch, $cb, $st);
+            } else {
+                $st->{offset} = $offset;
+            }
+        }
+        $st->{offset} += @page if defined $st->{offset};
+        push @$items, grep { !$st->{seen}{ $_->[0] }++ } @page;
+        my $more = defined $st->{offset} ? @page && $st->{offset} < ($total // 0)
+                                         : @$items > $had && @$items < ($total // 0);
+        return $self->offset_pages($fetch, $cb, $st) if $more;
+        $cb->([ map { $_->[1] } @$items ], $resp);
     });
 }
 
@@ -250,16 +286,18 @@ sub stream_list {
 
 # the API pages its lists (256 per reply): one reply with every page merged
 sub all_pages {
-    my ($self, $subj, $key, $cb, $have) = @_;
-    $have //= [];
-    $self->json_api($subj, @$have ? { offset => scalar @$have } : undef, sub {
-        my ($resp, $err) = @_;
-        return $cb->(@_) if $err;
-        my $page = $resp->{$key} || [];
-        push @$have, @$page;
-        return $self->all_pages($subj, $key, $cb, $have)
-            if @$page && $resp->{total} && @$have < $resp->{total};
-        $cb->({ %$resp, $key => $have, offset => 0, limit => scalar @$have }, undef);
+    my ($self, $subj, $key, $cb) = @_;
+    $self->offset_pages(sub {
+        my ($offset, $done) = @_;
+        $self->json_api($subj, $offset ? { offset => $offset } : undef, sub {
+            my ($resp, $err) = @_;
+            return $cb->(@_) if $err;
+            $done->($resp, $resp->{total},
+                map { [ $_->{name} // $_->{config}{name} // '', $_ ] } @{ $resp->{$key} || [] });
+        });
+    }, sub {
+        my ($items, $resp) = @_;
+        $cb->({ %$resp, $key => $items, offset => 0, limit => scalar @$items }, undef);
     });
 }
 

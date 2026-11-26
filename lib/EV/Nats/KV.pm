@@ -1,7 +1,7 @@
 package EV::Nats::KV;
 use strict;
 use warnings;
-our $VERSION = '0.08';
+our $VERSION = '0.09';
 use JSON::PP ();
 use EV::Nats::JetStream;
 

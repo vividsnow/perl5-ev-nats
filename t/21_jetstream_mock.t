@@ -620,44 +620,6 @@ subtest 'a fetch batch passed as a string goes out as a JSON number' => sub {
     $mock->stop;
 };
 
-subtest 'KV keys follows the paged subject list to its total' => sub {
-    plan tests => 2;
-    my $mock = MockNats->new(on_accept => sub {
-        my ($c, $report) = @_;
-        MockNats->handshake($c) or return;
-        my $rd = MockNats->reader($c);
-        my $req = qr/PUB \$JS\.API\.STREAM\.INFO\.KV_B (\S+) \d+\r\n([^\r]*)\r\n/;
-        my @pages = ({ 'a' => 1, 'b' => 1 }, { 'c' => 1 });
-        my @offsets;
-        for my $n (1 .. 2) {
-            my $buf = $rd->(qr/(?:.*?$req){$n}/s) or last;
-            my ($sid) = values %{ MockNats->subs_in($buf) };
-            my @m = $buf =~ /$req/g;
-            my ($reply, $body) = @m[2 * $n - 2, 2 * $n - 1];
-            my $offset = JSON::PP::decode_json($body)->{offset} // 0;
-            push @offsets, $offset;
-            my %subjects = map { ("\$KV.B.$_" => 1) } keys %{ $pages[$n - 1] };
-            syswrite $c, MockNats->msg_frame($reply, $sid, undef, JSON::PP::encode_json({
-                total => 3, offset => $offset, limit => 2, state => { subjects => \%subjects } }));
-        }
-        print $report "@offsets\n";
-    })->start;
-    my ($nats, $keys);
-    $nats = EV::Nats->new(
-        host => '127.0.0.1', port => $mock->port,
-        on_error   => sub { diag "error: $_[0]" },
-        on_connect => sub {
-            my $kv = EV::Nats::KV->new(js => EV::Nats::JetStream->new(nats => $nats), bucket => 'B');
-            $kv->keys(sub { $keys = $_[0]; EV::break });
-        },
-    );
-    run_guarded(3);
-    is_deeply [ sort @{ $keys || [] } ], [qw(a b c)], 'every page collected';
-    is $mock->report(5), '0 2', 'the second request asked from offset 2';
-    $nats->disconnect;
-    $mock->stop;
-};
-
 # answers the first $n requests with $answer->($subject, $body): a payload,
 # or [$headers, $payload]; reports the subjects asked
 sub api_mock {
@@ -669,7 +631,8 @@ sub api_mock {
         my $req = qr/PUB (\S+) (\S+) \d+\r\n([^\r]*)\r\n/;
         my @seen;
         for my $i (1 .. $n) {
-            my $buf = $rd->(qr/(?:.*?$req){$i}/s) or last;
+            # atomic: a plain (?:.*?$req){$i} backtracks combinatorially
+            my $buf = $rd->(qr/\A(?>.*?$req){$i}/s) or last;
             my ($sid) = values %{ MockNats->subs_in($buf) };
             my ($subj, $reply, $body) = ($buf =~ /$req/g)[3 * $i - 3 .. 3 * $i - 1];
             push @seen, $subj;
@@ -718,19 +681,62 @@ subtest 'a server TTL marker reads as a deleted key' => sub {
     $mock->stop;
 };
 
-subtest 'stream_list merges every page' => sub {
-    plan tests => 2;
-    my $mock = api_mock(sub {
-        my $offset = length $_[1] ? JSON::PP::decode_json($_[1])->{offset} : 0;
-        my @page = $offset ? ('C') : ('A', 'B');
-        JSON::PP::encode_json({ total => 3, offset => $offset, limit => 2,
-                                streams => [ map { { config => { name => $_ } } } @page ] });
-    }, 2);
-    my $list;
-    with_js($mock, sub { $_[0]->stream_list(sub { $list = $_[0]; EV::break }) });
-    is_deeply [ map { $_->{config}{name} } @{ $list->{streams} || [] } ], [qw(A B C)], 'all three';
-    is $mock->report(5), '$JS.API.STREAM.LIST,$JS.API.STREAM.LIST', 'in two requests';
-    $mock->stop;
+# a server list paged as nats-server does: sorted by name, sliced at the
+# asked offset, 3 per page; $churn->($names, $n) may change it before answer $n
+sub listing_mock {
+    my ($kind, $names, $churn) = @_;
+    my $n = 0;
+    api_mock(sub {
+        my (undef, $body) = @_;
+        $churn->($names, ++$n) if $churn;
+        my $offset = length $body ? JSON::PP::decode_json($body)->{offset} // 0 : 0;
+        my @sorted = sort @$names;
+        my @page = grep { defined } @sorted[$offset .. $offset + 2];
+        my %reply = (total => scalar @sorted, offset => $offset, limit => 3);
+        if    ($kind eq 'keys')      { $reply{state}{subjects} = { map { ("\$KV.B.$_" => 1) } @page } }
+        elsif ($kind eq 'streams')   { $reply{streams} = [ map { { config => { name => $_ } } } @page ] }
+        else                         { $reply{consumers} = [ map { { name => $_ } } @page ] }
+        JSON::PP::encode_json(\%reply);
+    }, 40);
+}
+
+subtest 'paged lists come back whole while they change' => sub {
+    my @names = map { sprintf 'c%02d', $_ } 1 .. 8;
+    my %calls = (
+        keys      => sub { EV::Nats::KV->new(js => $_[0], bucket => 'B')->keys($_[1]) },
+        streams   => sub { my ($js, $done) = @_; $js->stream_list(sub {
+                               $done->($_[0] && [ map { $_->{config}{name} } @{ $_[0]{streams} } ], $_[1]) }) },
+        consumers => sub { my ($js, $done) = @_; $js->consumer_list('S', sub {
+                               $done->($_[0] && [ map { $_->{name} } @{ $_[0]{consumers} } ], $_[1]) }) },
+    );
+    my @cases = (
+        [consumers => 'unchanged'],
+        [consumers => 'one deleted ahead of the offset', sub { @{ $_[0] } = grep { $_ ne 'c01' } @{ $_[0] } if $_[1] == 2 }],
+        [consumers => 'one created ahead of the offset', sub { push @{ $_[0] }, 'a01' if $_[1] == 2 }],
+        [streams   => 'one deleted, one created', sub {
+            if ($_[1] == 3) { @{ $_[0] } = grep { $_ ne 'c02' } @{ $_[0] }; push @{ $_[0] }, 'b01' } }],
+        [keys      => 'one deleted ahead of the offset', sub { @{ $_[0] } = grep { $_ ne 'c03' } @{ $_[0] } if $_[1] == 2 }],
+    );
+    # every answer moves the list: the relists run out and plain offsets finish it
+    push @cases, [consumers => 'changing before every answer', sub { push @{ $_[0] }, sprintf 'a%02d', $_[1] }];
+    plan tests => scalar @cases;
+    for my $case (@cases) {
+        my ($kind, $label, $churn) = @$case;
+        my $mock = listing_mock($kind, [@names], $churn);
+        my ($got, $err);
+        with_js($mock, sub { my $js = shift; $calls{$kind}->($js, sub { ($got, $err) = @_; EV::break }) });
+        # the mock churns in its own process: replay it for what existed when
+        my %ever = map { $_ => 1 } @names;
+        my @list = @names;
+        for my $n (1 .. 40) { $churn->(\@list, $n) if $churn; $ever{$_} = 1 for @list }
+        my %n; $n{$_}++ for @{ $got || [] };
+        my @lasting = grep { my $x = $_; grep { $_ eq $x } @list } @names;
+        my @bad = ((grep { ($n{$_} // 0) != 1 } @lasting), (grep { !$ever{$_} } keys %n),
+                   (grep { $n{$_} > 1 } keys %n));
+        ok $got && !@bad, "$kind, $label: every lasting entry once, nothing invented"
+            or diag "got @{ $got || [] }; bad @bad; error " . ($err // 'none') . '; asked ' . $mock->report(5);
+        $mock->stop;
+    }
 };
 
 subtest 'a reply that is not a JSON object reaches the callback' => sub {
